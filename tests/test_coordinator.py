@@ -7,6 +7,7 @@ import pytest
 
 from custom_components.geekmagic.const import (
     BACKOFF_LOG_INTERVAL,
+    CONF_DEVICE_SLIDESHOW,
     CONF_LAYOUT,
     CONF_MANAGE_PRO_ALBUM,
     CONF_REFRESH_INTERVAL,
@@ -1218,3 +1219,219 @@ class TestCoordinatorPause:
             await coordinator.async_set_active(False)
 
         mock_notify.assert_called_once()
+
+
+class TestDeviceSlideshow:
+    """Test handing view cycling over to the device's own slideshow."""
+
+    @pytest.fixture
+    def slideshow_device(self):
+        """Create mock device whose firmware keeps a browsable image album."""
+        device = MagicMock()
+        device.host = "192.168.1.100"
+        device.model = "unknown"
+        device.profile = MagicMock(display_mechanism="direct_image")
+        device.display_rendered_dashboard = AsyncMock()
+        device.upload = AsyncMock()
+        device.delete_file = AsyncMock()
+        device.set_image = AsyncMock()
+        device.set_album_display = AsyncMock()
+        device.set_brightness = AsyncMock()
+        device.get_brightness = AsyncMock(return_value=50)
+        device.get_state = AsyncMock(return_value=None)
+        device.get_space = AsyncMock(return_value=None)
+        device.is_builtin_theme = MagicMock(return_value=False)
+        device.set_theme_custom = AsyncMock()
+        return device
+
+    @pytest.fixture
+    def slideshow_options(self):
+        """Create three-view options with device slideshow enabled."""
+        return {
+            CONF_REFRESH_INTERVAL: 60,
+            CONF_SCREEN_CYCLE_INTERVAL: 5,
+            CONF_DEVICE_SLIDESHOW: True,
+            CONF_SCREENS: [
+                {
+                    "name": f"View {i}",
+                    CONF_LAYOUT: LAYOUT_GRID_2X2,
+                    CONF_WIDGETS: [{"type": "clock", "slot": 0}],
+                }
+                for i in range(3)
+            ],
+        }
+
+    @pytest.mark.asyncio
+    async def test_uploads_one_file_per_view(self, hass, slideshow_device, slideshow_options):
+        """Every view is uploaded under its own filename."""
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            result = await coordinator._async_update_data()
+
+        assert result["success"] is True
+        assert result["device_slideshow"] is True
+        assert result["views"] == 3
+
+        uploaded = [call.args[1] for call in slideshow_device.upload.await_args_list]
+        assert uploaded == ["gmview0.jpg", "gmview1.jpg", "gmview2.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_upload_through_the_pinning_path(
+        self, hass, slideshow_device, slideshow_options
+    ):
+        """display_rendered_dashboard re-pins on every refresh; upload does not."""
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            await coordinator._async_update_data()
+            await coordinator._async_update_data()
+
+        slideshow_device.display_rendered_dashboard.assert_not_awaited()
+        # Selected once, on the first pass only.
+        slideshow_device.set_image.assert_awaited_once_with("gmview0.jpg")
+
+    @pytest.mark.asyncio
+    async def test_enables_device_autoplay(self, hass, slideshow_device, slideshow_options):
+        """Without autoplay the firmware shows one image, not a slideshow."""
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            await coordinator._async_update_data()
+
+        slideshow_device.set_album_display.assert_awaited_once_with(
+            interval=5, gif_loop=None, autoplay=1
+        )
+
+    @pytest.mark.asyncio
+    async def test_selects_a_view_before_dropping_dashboard(
+        self, hass, slideshow_device, slideshow_options
+    ):
+        """Deleting the selected image first makes the device show "No Images"."""
+        calls: list[str] = []
+        slideshow_device.set_image = AsyncMock(side_effect=lambda *a, **kw: calls.append("select"))
+        slideshow_device.delete_file = AsyncMock(side_effect=lambda *a: calls.append("delete"))
+
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            await coordinator._async_update_data()
+
+        assert calls == ["select", "delete"]
+
+    @pytest.mark.asyncio
+    async def test_survives_a_device_without_album_settings(
+        self, hass, slideshow_device, slideshow_options
+    ):
+        """Firmware that rejects the autoplay call still gets its views."""
+        slideshow_device.set_album_display = AsyncMock(side_effect=RuntimeError("unsupported"))
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            result = await coordinator._async_update_data()
+
+        assert result["success"] is True
+        assert slideshow_device.upload.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_renders_each_screen_not_just_current(
+        self, hass, slideshow_device, slideshow_options
+    ):
+        """Each view is rendered with its own index, not the current screen."""
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(
+            coordinator, "_render_display", return_value=(b"jpeg", b"png")
+        ) as mock_render:
+            await coordinator._async_update_data()
+
+        rendered = [call.args[0] for call in mock_render.call_args_list]
+        assert rendered == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    async def test_removes_single_file_leftover(self, hass, slideshow_device, slideshow_options):
+        """dashboard.jpg is cleared once, so it isn't a frozen extra slide."""
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            await coordinator._async_update_data()
+            await coordinator._async_update_data()
+
+        deleted = [call.args[0] for call in slideshow_device.delete_file.await_args_list]
+        assert deleted == ["/image/dashboard.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_cycle_in_the_integration(
+        self, hass, slideshow_device, slideshow_options
+    ):
+        """The current screen stays put; the device does the advancing."""
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+        coordinator._last_screen_change = 0  # cycle interval long since elapsed
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            await coordinator._async_update_data()
+
+        assert coordinator._current_screen == 0
+
+    @pytest.mark.asyncio
+    async def test_prunes_files_when_views_are_removed(
+        self, hass, slideshow_device, slideshow_options
+    ):
+        """Dropping to one view deletes the now-orphaned files."""
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            await coordinator._async_update_data()
+            coordinator._layouts = coordinator._layouts[:1]
+            slideshow_device.delete_file.reset_mock()
+            await coordinator._async_update_data()
+
+        deleted = [call.args[0] for call in slideshow_device.delete_file.await_args_list]
+        assert deleted == ["/image/gmview1.jpg", "/image/gmview2.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_cleans_up_when_switched_back_off(
+        self, hass, slideshow_device, slideshow_options
+    ):
+        """Disabling the option clears the per-view files from the album."""
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            await coordinator._async_update_data()
+            coordinator.options[CONF_DEVICE_SLIDESHOW] = False
+            slideshow_device.delete_file.reset_mock()
+            await coordinator._async_update_data()
+
+        deleted = [call.args[0] for call in slideshow_device.delete_file.await_args_list]
+        assert deleted == ["/image/gmview0.jpg", "/image/gmview1.jpg", "/image/gmview2.jpg"]
+        slideshow_device.display_rendered_dashboard.assert_awaited_once()
+        # Autoplay off, or the device keeps cycling behind the integration.
+        assert slideshow_device.set_album_display.await_args.kwargs["autoplay"] == 0
+
+    @pytest.mark.asyncio
+    async def test_ignored_on_firmware_without_an_album(
+        self, hass, slideshow_device, slideshow_options
+    ):
+        """SD_PRO drives its slideshow differently, so the option is inert."""
+        slideshow_device.profile = MagicMock(display_mechanism="photo_slideshow")
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        with patch.object(coordinator, "_render_display", return_value=(b"jpeg", b"png")):
+            result = await coordinator._async_update_data()
+
+        assert "device_slideshow" not in result
+        slideshow_device.upload.assert_not_awaited()
+        slideshow_device.display_rendered_dashboard.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_prefetches_data_for_every_view(self, hass, slideshow_device, slideshow_options):
+        """All views render each pass, so all views' async data is needed.
+
+        Fetching only the current screen leaves the other views' charts and
+        camera images rendering as "No data".
+        """
+        coordinator = GeekMagicCoordinator(hass, slideshow_device, slideshow_options)
+
+        assert len(coordinator._layouts_needing_data()) == 3
+
+        coordinator.options[CONF_DEVICE_SLIDESHOW] = False
+        assert len(coordinator._layouts_needing_data()) == 1
