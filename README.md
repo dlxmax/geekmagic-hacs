@@ -173,6 +173,7 @@ The default `watchOS` theme is inspired by Apple's watchOS Human Interface Guide
 - **Visual configuration**: Custom sidebar panel with live preview
 - **Global views**: Create views once, assign to multiple devices
 - **Multi-screen support**: Assign multiple views per device with auto-cycling
+- **Device slideshow**: Optionally let the firmware cycle views itself, so screen changes cost no re-render and no upload
 - **Notification service**: Show temporary alerts with text, icons, or camera images
 - **Pure Python rendering**: Uses Pillow for image generation (no browser required)
 - **Configurable refresh**: Updates every 5-300 seconds
@@ -260,6 +261,7 @@ Each GeekMagic device creates the following entities for control and monitoring:
 | `select.geekmagic_current_view` | Select | Currently displayed view (when in Custom mode) |
 | `switch.geekmagic_active` | Switch | Enable/disable the display (sleep/wake) |
 | `switch.geekmagic_view_cycling` | Switch | Enable/disable automatic view cycling |
+| `switch.geekmagic_device_slideshow` | Switch | Let the device cycle views itself (see [Device Slideshow](#device-slideshow)) |
 
 ### Sensors
 
@@ -276,6 +278,36 @@ Each GeekMagic device creates the following entities for control and monitoring:
 | `button.geekmagic_refresh` | Button | Force immediate display refresh |
 | `button.geekmagic_next_screen` | Button | Switch to next view in rotation |
 | `button.geekmagic_previous_screen` | Button | Switch to previous view in rotation |
+
+### Device Slideshow
+
+By default the integration does the cycling: on every refresh it re-renders the
+current view and uploads it as a single file. That makes the refresh interval do
+double duty — it is also the screen-change interval — so a fast rotation means
+constantly re-rendering and re-uploading images whose data has not changed.
+
+Turning on `switch.geekmagic_device_slideshow` uploads **every** assigned view as
+its own file and lets the firmware's built-in slideshow advance between them:
+
+|  | Integration cycling (default) | Device slideshow |
+|--|--|--|
+| Screen change | re-render + upload | free, done on the device |
+| Rotation speed | tied to refresh interval | set on the device |
+| Refresh interval controls | both data freshness and rotation | data freshness only |
+| Uploads per minute | one per screen change | one per view, per refresh |
+
+With four views, a 5-second rotation and a 60-second refresh, that is 4
+uploads/minute instead of 12, and the rotation runs on the device's own clock
+rather than drifting with render and upload latency.
+
+Set the rotation speed on the device itself (on stock firmware: picture mode and
+its slide delay). The integration's own cycle interval is ignored while this is
+on, and `select.geekmagic_current_view` no longer reflects what is on screen,
+since the device decides that.
+
+Requires firmware with a browsable image album — stock SmallTV Ultra and Pro.
+The switch is unavailable on SD_PRO, which drives its slideshow through a
+different API.
 
 ### Presence-Based Sleep/Wake
 
