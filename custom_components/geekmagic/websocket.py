@@ -18,6 +18,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_DEVICE_SLIDESHOW,
     CONF_REFRESH_INTERVAL,
     CONF_SCREEN_CYCLE_INTERVAL,
     DEFAULT_REFRESH_INTERVAL,
@@ -349,6 +350,7 @@ async def ws_devices_assign_views(
         vol.Optional("brightness"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
         vol.Optional("refresh_interval"): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
         vol.Optional("cycle_interval"): vol.All(vol.Coerce(int), vol.Range(min=0, max=3600)),
+        vol.Optional("device_slideshow"): bool,
     }
 )
 @websocket_api.async_response
@@ -381,6 +383,9 @@ async def ws_devices_settings(
 
     if "cycle_interval" in msg:
         new_options[CONF_SCREEN_CYCLE_INTERVAL] = msg["cycle_interval"]
+
+    if "device_slideshow" in msg:
+        new_options[CONF_DEVICE_SLIDESHOW] = msg["device_slideshow"]
 
     hass.config_entries.async_update_entry(entry, options=new_options)
 

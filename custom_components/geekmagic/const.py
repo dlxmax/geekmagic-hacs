@@ -45,6 +45,16 @@ CONF_CURRENT_SCREEN = "current_screen"
 CONF_SCREEN_THEME = "theme"
 DEFAULT_SCREEN_CYCLE_INTERVAL = 0  # 0 = manual only, >0 = seconds between screens
 
+# Device-side slideshow: upload every view as its own album file and let the
+# firmware's built-in slideshow advance between them, instead of cycling by
+# re-rendering and re-uploading a single file on every refresh.
+CONF_DEVICE_SLIDESHOW = "device_slideshow"
+DEFAULT_DEVICE_SLIDESHOW = False
+DEVICE_SLIDESHOW_FILENAME = "gmview{index}.jpg"
+# Upper bound on gmview*.jpg files probed for deletion when the view count
+# shrinks. Well above any practical number of views.
+DEVICE_SLIDESHOW_MAX_FILES = 32
+
 # Theme types
 THEME_WATCHOS = "watchos"
 THEME_CLASSIC = "classic"

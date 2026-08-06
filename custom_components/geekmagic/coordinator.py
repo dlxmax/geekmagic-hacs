@@ -20,6 +20,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     BACKOFF_LOG_INTERVAL,
+    CONF_DEVICE_SLIDESHOW,
     CONF_DISPLAY_ROTATION,
     CONF_JPEG_QUALITY,
     CONF_LAYOUT,
@@ -29,10 +30,13 @@ from .const import (
     CONF_SCREEN_THEME,
     CONF_SCREENS,
     CONF_WIDGETS,
+    DEFAULT_DEVICE_SLIDESHOW,
     DEFAULT_DISPLAY_ROTATION,
     DEFAULT_JPEG_QUALITY,
     DEFAULT_REFRESH_INTERVAL,
     DEFAULT_SCREEN_CYCLE_INTERVAL,
+    DEVICE_SLIDESHOW_FILENAME,
+    DEVICE_SLIDESHOW_MAX_FILES,
     DOMAIN,
     LAYOUT_FULLSCREEN,
     LAYOUT_GRID_2X2,
@@ -331,6 +335,9 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
         self._layouts: list = []  # List of layouts for each screen
         self._current_screen: int = 0
         self._last_screen_change: float = time.time()
+        # Highest slideshow file index written so far, so stale gmview*.jpg
+        # can be removed when the number of views drops.
+        self._slideshow_file_count: int = 0
         self._last_image: bytes | None = None  # PNG bytes for camera preview
         self._last_update_success: bool = False
         self._last_update_time: float | None = None
@@ -797,25 +804,29 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
 
         return states
 
-    def _render_display(self) -> tuple[bytes, bytes]:
-        """Render the display image (runs in executor thread).
+    def _render_display(self, screen_index: int | None = None) -> tuple[bytes, bytes]:
+        """Render a display image (runs in executor thread).
+
+        Args:
+            screen_index: Screen to render. Defaults to the current screen;
+                device slideshow mode passes each index in turn.
 
         Returns:
             Tuple of (jpeg_data, png_data)
         """
+        index = self._current_screen if screen_index is None else screen_index
+
         # Create canvas using the active layout's theme background, so
         # non-black themes (light, candy, ocean) render the correct base.
         active_layout = (
-            self._layouts[self._current_screen]
-            if self._layouts and 0 <= self._current_screen < len(self._layouts)
-            else None
+            self._layouts[index] if self._layouts and 0 <= index < len(self._layouts) else None
         )
         canvas_bg = active_layout.theme.background if active_layout else (0, 0, 0)
         img, draw = self.renderer.create_canvas(background=canvas_bg)
 
-        # Render current screen's layout
-        if self._layouts and 0 <= self._current_screen < len(self._layouts):
-            layout = self._layouts[self._current_screen]
+        # Render the selected screen's layout
+        if self._layouts and 0 <= index < len(self._layouts):
+            layout = self._layouts[index]
 
             # Check for active notification
             if time.time() < self._notification_expiry and self._notification_data:
@@ -845,6 +856,140 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
         png_data = self.renderer.to_png(img, rotation=rotation)
 
         return jpeg_data, png_data
+
+    @property
+    def _device_slideshow_enabled(self) -> bool:
+        """Return True when views should be cycled by the device itself.
+
+        Requires firmware that keeps an album of uploaded images and advances
+        through it on its own timer. SD_PRO drives its slideshow through a
+        different API (enable/disable per photo) and is excluded here.
+        """
+        if not self.options.get(CONF_DEVICE_SLIDESHOW, DEFAULT_DEVICE_SLIDESHOW):
+            return False
+        return self.device.profile.display_mechanism in ("direct_image", "picture_album")
+
+    async def _async_update_device_slideshow(self) -> dict[str, Any]:
+        """Render every view and upload each as its own album file.
+
+        The firmware advances between them, so screen changes cost no network
+        traffic and no re-render. The refresh interval then controls only how
+        stale the data on those images may get, not how fast the screen moves.
+        """
+        count = max(1, len(self._layouts))
+        total_bytes = 0
+        first_run = self._slideshow_file_count == 0
+
+        for index in range(count):
+            jpeg_data, png_data = await self.hass.async_add_executor_job(
+                self._render_display, index
+            )
+            total_bytes += len(jpeg_data)
+
+            # The preview entity mirrors the screen the user has selected in
+            # the panel, not whichever one happens to be rendering here.
+            if index == self._current_screen and self._update_preview:
+                self._last_image = png_data
+
+            # upload() rather than display_rendered_dashboard(): the latter
+            # also calls set_image, which pins the display to one file and
+            # stops the slideshow dead.
+            await self.device.upload(jpeg_data, DEVICE_SLIDESHOW_FILENAME.format(index=index))
+
+        self._preview_just_updated = self._update_preview
+        self._update_preview = False
+
+        if first_run:
+            await self._async_start_device_slideshow(count)
+
+        await self._async_prune_slideshow_files(count)
+
+        self._last_update_success = True
+        self._last_update_time = time.time()
+
+        _LOGGER.debug(
+            "Device slideshow update completed: %d views, %.1fKB total",
+            count,
+            total_bytes / 1024,
+        )
+
+        return {
+            "success": True,
+            "device_slideshow": True,
+            "views": count,
+            "size_kb": total_bytes / 1024,
+            "current_screen": self._current_screen,
+            "screen_name": self.current_screen_name,
+        }
+
+    async def _async_start_device_slideshow(self, count: int) -> None:
+        """Point the device at the new album files and start it advancing.
+
+        Order matters. The album has to be pointed at a file that exists and
+        autoplay switched on *before* dashboard.jpg goes, otherwise the
+        firmware finds its selected image missing and paints "No Images" over
+        the screen until something re-selects for it.
+        """
+        # Custom image mode, showing the first view. Without a valid selection
+        # autoplay has nothing to advance from.
+        await self.device.set_image(DEVICE_SLIDESHOW_FILENAME.format(index=0))
+
+        # The integration's cycle interval is unused in this mode, so it is
+        # what the device's own slide timer gets set to. Left alone at 0, which
+        # means "manual only" to the integration and has no device equivalent.
+        interval = self.options.get(CONF_SCREEN_CYCLE_INTERVAL, DEFAULT_SCREEN_CYCLE_INTERVAL)
+        try:
+            await self.device.set_album_display(
+                interval=interval if interval > 0 else None,
+                gif_loop=None,
+                autoplay=1,
+            )
+        except Exception as err:
+            _LOGGER.warning(
+                "Could not enable the device's album autoplay (%s); "
+                "views are uploaded but the device may not advance between them",
+                err,
+            )
+
+        if count > 1:
+            _LOGGER.debug("Device slideshow started across %d views", count)
+
+        # Safe to drop now: the album is pointed at gmview0.jpg.
+        try:
+            await self.device.delete_file("/image/dashboard.jpg")
+        except Exception as err:
+            _LOGGER.debug("No dashboard.jpg to remove: %s", err)
+
+    async def _async_stop_device_slideshow(self) -> None:
+        """Hand the display back to single-file mode.
+
+        Autoplay is turned off explicitly; leaving it on would have the device
+        cycling whatever else is in the album behind the integration's back.
+        """
+        try:
+            await self.device.set_album_display(interval=None, gif_loop=None, autoplay=0)
+        except Exception as err:
+            _LOGGER.debug("Could not disable album autoplay: %s", err)
+
+    async def _async_prune_slideshow_files(self, keep: int) -> None:
+        """Delete slideshow files left behind when the view count shrinks.
+
+        Only runs when the count actually drops, so the steady state costs no
+        extra requests. Deletes are best-effort: a file that was never there
+        answers with an error on some firmwares, which is not a failure.
+        """
+        if keep >= self._slideshow_file_count:
+            self._slideshow_file_count = keep
+            return
+
+        for index in range(keep, min(self._slideshow_file_count, DEVICE_SLIDESHOW_MAX_FILES)):
+            filename = DEVICE_SLIDESHOW_FILENAME.format(index=index)
+            try:
+                await self.device.delete_file(f"/image/{filename}")
+            except Exception as err:
+                _LOGGER.debug("Could not delete stale slideshow file %s: %s", filename, err)
+
+        self._slideshow_file_count = keep
 
     async def trigger_notification(self, data: dict[str, Any]) -> None:
         """Trigger a notification on this device.
@@ -1026,10 +1171,14 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
                 self.current_screen_name,
             )
 
-            # Check for auto-cycling
+            # Check for auto-cycling. Skipped in device slideshow mode, where
+            # every view is on the device already and the firmware advances
+            # between them on its own clock.
             cycle_interval = self.options.get(
                 CONF_SCREEN_CYCLE_INTERVAL, DEFAULT_SCREEN_CYCLE_INTERVAL
             )
+            if self._device_slideshow_enabled:
+                cycle_interval = 0
             if cycle_interval > 0 and len(self._layouts) > 1:
                 now = time.time()
                 if now - self._last_screen_change >= cycle_interval:
@@ -1100,6 +1249,16 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
             await self._async_fetch_chart_history()
             await self._async_fetch_candlestick_history()
             await self._async_fetch_weather_forecasts()
+
+            if self._device_slideshow_enabled:
+                return await self._async_update_device_slideshow()
+
+            if self._slideshow_file_count:
+                # Switched back to single-file mode: stop the device advancing
+                # and clear the per-view files, or the firmware keeps cycling
+                # them alongside dashboard.jpg.
+                await self._async_stop_device_slideshow()
+                await self._async_prune_slideshow_files(0)
 
             # Render image in executor to avoid blocking the event loop
             # (Pillow image operations are CPU-intensive)
@@ -1430,6 +1589,22 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
         self._update_preview = True
         await self.async_request_refresh()
 
+    def _layouts_needing_data(self) -> list[Any]:
+        """Layouts whose async data must be pre-fetched before rendering.
+
+        Normally only the screen about to be drawn. Device slideshow mode
+        renders every view in a single pass, so every view's charts, camera
+        images, media art and forecasts are needed -- fetching just the
+        current screen leaves the others to render as "No data".
+        """
+        if not self._layouts:
+            return []
+        if self._device_slideshow_enabled:
+            return list(self._layouts)
+        if 0 <= self._current_screen < len(self._layouts):
+            return [self._layouts[self._current_screen]]
+        return []
+
     async def _async_fetch_camera_images(self) -> None:
         """Pre-fetch camera images for all camera widgets.
 
@@ -1442,8 +1617,7 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
         camera_entity_ids: set[str] = set()
         other_entity_ids: set[str] = set()
 
-        if self._layouts and 0 <= self._current_screen < len(self._layouts):
-            layout = self._layouts[self._current_screen]
+        for layout in self._layouts_needing_data():
             for slot in layout.slots:
                 if slot.widget and isinstance(slot.widget, CameraWidget):
                     entity_id = slot.widget.config.entity_id
@@ -1546,8 +1720,7 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
         # Find all media widgets in current layout
         media_entity_ids: set[str] = set()
 
-        if self._layouts and 0 <= self._current_screen < len(self._layouts):
-            layout = self._layouts[self._current_screen]
+        for layout in self._layouts_needing_data():
             for slot in layout.slots:
                 if slot.widget and isinstance(slot.widget, MediaWidget):
                     entity_id = slot.widget.config.entity_id
@@ -1711,8 +1884,7 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
         # Find all chart widgets in current layout
         chart_widgets: list[tuple[str, ChartWidget]] = []
 
-        if self._layouts and 0 <= self._current_screen < len(self._layouts):
-            layout = self._layouts[self._current_screen]
+        for layout in self._layouts_needing_data():
             for slot in layout.slots:
                 if slot.widget and isinstance(slot.widget, ChartWidget):
                     entity_id = slot.widget.config.entity_id
@@ -1779,8 +1951,7 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
         # Find all candlestick widgets in current layout
         candlestick_widgets: list[tuple[str, CandlestickWidget]] = []
 
-        if self._layouts and 0 <= self._current_screen < len(self._layouts):
-            layout = self._layouts[self._current_screen]
+        for layout in self._layouts_needing_data():
             for slot in layout.slots:
                 if slot.widget and isinstance(slot.widget, CandlestickWidget):
                     entity_id = slot.widget.config.entity_id
@@ -1855,8 +2026,7 @@ class GeekMagicCoordinator(DataUpdateCoordinator):
         # Find all weather widgets in current layout
         weather_entity_ids: set[str] = set()
 
-        if self._layouts and 0 <= self._current_screen < len(self._layouts):
-            layout = self._layouts[self._current_screen]
+        for layout in self._layouts_needing_data():
             for slot in layout.slots:
                 if slot.widget and isinstance(slot.widget, WeatherWidget):
                     entity_id = slot.widget.config.entity_id

@@ -10,7 +10,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from ..const import CONF_SCREEN_CYCLE_INTERVAL, DOMAIN
+from ..const import (
+    CONF_DEVICE_SLIDESHOW,
+    CONF_SCREEN_CYCLE_INTERVAL,
+    DEFAULT_DEVICE_SLIDESHOW,
+    DOMAIN,
+)
 from .base import GeekMagicEntity
 
 if TYPE_CHECKING:
@@ -33,6 +38,7 @@ async def async_setup_entry(
     entities = [
         GeekMagicActiveSwitch(coordinator),
         GeekMagicViewCyclingSwitch(coordinator),
+        GeekMagicDeviceSlideshowSwitch(coordinator),
     ]
 
     async_add_entities(entities)
@@ -123,3 +129,52 @@ class GeekMagicViewCyclingSwitch(GeekMagicEntity, SwitchEntity):
         }
         self.hass.config_entries.async_update_entry(self.coordinator.entry, options=new_options)
         _LOGGER.debug("View cycling disabled (was %ds)", current_interval)
+
+
+class GeekMagicDeviceSlideshowSwitch(GeekMagicEntity, SwitchEntity):
+    """Switch to hand view cycling over to the device.
+
+    Off (default), the integration cycles: it re-renders and re-uploads one
+    file on every refresh, so the refresh interval doubles as the screen-change
+    interval and a fast rotation means constant traffic and flash writes.
+
+    On, every view is uploaded as its own file and the firmware's own slideshow
+    advances between them. Screen changes then cost nothing, the rotation speed
+    is whatever the device is set to, and the refresh interval only governs how
+    fresh the data on each image is.
+    """
+
+    _attr_name = "Device Slideshow"
+    _attr_icon = "mdi:image-multiple"
+
+    def __init__(self, coordinator: GeekMagicCoordinator) -> None:
+        """Initialize device slideshow switch."""
+        super().__init__(coordinator, "device_slideshow")
+
+    @property
+    def available(self) -> bool:
+        """Only firmwares with a browsable image album can do this."""
+        return super().available and self.coordinator.device.profile.display_mechanism in (
+            "direct_image",
+            "picture_album",
+        )
+
+    @property
+    def is_on(self) -> bool:
+        """Return True if the device drives the slideshow."""
+        return bool(self.coordinator.options.get(CONF_DEVICE_SLIDESHOW, DEFAULT_DEVICE_SLIDESHOW))
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Hand cycling over to the device."""
+        await self._async_set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Take cycling back into the integration."""
+        await self._async_set(False)
+
+    async def _async_set(self, enabled: bool) -> None:
+        if self.is_on == enabled:
+            return
+        new_options = {**self.coordinator.entry.options, CONF_DEVICE_SLIDESHOW: enabled}
+        self.hass.config_entries.async_update_entry(self.coordinator.entry, options=new_options)
+        _LOGGER.debug("Device slideshow %s", "enabled" if enabled else "disabled")
